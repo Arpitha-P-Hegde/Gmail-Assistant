@@ -32,7 +32,7 @@ class GmailService:
             .get(
                 userId="me",
                 id=message_id,
-                format="metadata",
+                format="full",
             )
             .execute()
         )
