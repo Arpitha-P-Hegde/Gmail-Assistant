@@ -1,74 +1,73 @@
-import json
-from pathlib import Path
+"""Small, local email categorizer used by sync and search."""
 
-import faiss
-from sentence_transformers import SentenceTransformer
-
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-
-INDEX_PATH = DATA_DIR / "emails.faiss"
-METADATA_PATH = DATA_DIR / "faiss_metadata.json"
-
-MODEL_NAME = "all-MiniLM-L6-v2"
-
+from database.db import initialize_database
+from database.email_repository import get_all_emails, update_email_category
+from ml.embeddings import load_model
 
 CATEGORIES = {
-    "Jobs": "job opportunities, internships, recruitment, interviews, careers, employment, hiring",
-    
-    "Education": "education, courses, learning, tutorials, certifications, study, programming lessons",
-    
-    "Shopping": "shopping, products, purchases, orders, discounts, offers, deals, ecommerce",
-    
-    "Bank": "banking, bank account, transactions, payments, statements, credit cards, financial alerts",
-    
-    "LinkedIn": "LinkedIn notifications, professional network, connections, LinkedIn jobs, profile activity",
-    
-    "GitHub": "GitHub notifications, repositories, commits, pull requests, issues, developers",
-    
-    "Other": "general personal or miscellaneous emails"
+    "Jobs": "job opportunities internships recruitment interviews careers employment hiring",
+    "Education": "education courses learning tutorials certifications study programming lessons",
+    "Shopping": "shopping products purchases orders discounts offers deals ecommerce",
+    "Bank": "banking bank account transactions payments statements credit cards financial alerts",
+    "LinkedIn": "LinkedIn notifications professional network connections profile activity",
+    "GitHub": "GitHub notifications repositories commits pull requests issues developers",
+    "Other": "general personal or miscellaneous emails",
 }
 
 
-def categorize_emails():
+def _rule_category(sender, subject, body):
+    sender_subject = f"{sender} {subject}".lower()
+    text = f"{sender_subject} {body}".lower()
+    if "linkedin" in sender_subject:
+        return "LinkedIn"
+    if "github" in sender_subject or "@github.com" in sender_subject:
+        return "GitHub"
+    if any(site in sender_subject for site in ("realpython", "coursera", "udemy", "edx", "codecademy", "freecodecamp")):
+        return "Education"
+    if any(word in sender_subject for word in ("bank", "transaction", "credit card", "debit card", "statement", "upi")):
+        return "Bank"
+    if any(word in sender_subject for word in ("interview", "job", "hiring", "recruit", "internship", "career")):
+        return "Jobs"
+    if any(word in sender_subject for word in ("course", "tutorial", "learning", "certificate", "education", "bootcamp")):
+        return "Education"
+    if any(word in sender_subject for word in ("order", "purchase", "shopping", "discount", "offer", "sale")):
+        return "Shopping"
+    return None
 
-    model = SentenceTransformer(MODEL_NAME)
 
-    index = faiss.read_index(str(INDEX_PATH))
+def categorize_email(email, model=None, category_embeddings=None):
+    """Classify one stored email; deterministic sender/keyword rules win."""
+    sender, subject = email["sender"] or "", email["subject"] or ""
+    body = (email["body_text"] or "")[:3000]
+    rule_match = _rule_category(sender, subject, body)
+    if rule_match:
+        return rule_match
+    if model is None:
+        model = load_model()
+    names = list(CATEGORIES)
+    if category_embeddings is None:
+        category_embeddings = model.encode(list(CATEGORIES.values()), normalize_embeddings=True)
+    vector = model.encode([f"Subject: {subject}\n{body}"], normalize_embeddings=True)[0]
+    return names[int((category_embeddings @ vector).argmax())]
 
-    with open(METADATA_PATH, "r", encoding="utf-8") as file:
-        metadata = json.load(file)
 
-    category_names = list(CATEGORIES.keys())
-
-    category_descriptions = list(CATEGORIES.values())
-
-    category_embeddings = model.encode(
-        category_descriptions,
-        normalize_embeddings=True
-    )
-
-    print("\nEMAIL CATEGORIES\n")
-
-    for email_index, email in enumerate(metadata):
-
-        email_vector = index.reconstruct(email_index)
-
-        scores = category_embeddings @ email_vector
-
-        best_category_index = scores.argmax()
-
-        category = category_names[best_category_index]
-
-        score = scores[best_category_index]
-
-        print("=" * 60)
-        print(f"Subject:  {email['subject']}")
-        print(f"From:     {email['sender']}")
-        print(f"Category: {category}")
-        print(f"Score:    {score:.4f}")
-        print()
+def categorize_emails(only_uncategorized=False):
+    """Classify persisted messages and save the result in SQLite."""
+    initialize_database()
+    emails = get_all_emails()
+    if only_uncategorized:
+        emails = [email for email in emails if not email["category"]]
+    if not emails:
+        print("No emails need categorization.")
+        return 0
+    model = load_model()
+    category_embeddings = model.encode(list(CATEGORIES.values()), normalize_embeddings=True)
+    for email in emails:
+        category = categorize_email(email, model, category_embeddings)
+        update_email_category(email["id"], category)
+        subject = (email["subject"] or "").encode("ascii", "backslashreplace").decode("ascii")
+        print(f"{category}: {subject}")
+    return len(emails)
 
 
 if __name__ == "__main__":

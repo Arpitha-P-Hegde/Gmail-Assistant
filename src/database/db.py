@@ -38,5 +38,21 @@ def initialize_database():
         )
     """)
 
+    # Older installations were created before categories existed.  SQLite's
+    # ADD COLUMN is safe here: it preserves every existing message.
+    columns = {
+        row["name"]
+        for row in cursor.execute("PRAGMA table_info(emails)").fetchall()
+    }
+    if "category" not in columns:
+        cursor.execute("ALTER TABLE emails ADD COLUMN category TEXT")
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emails_thread_id ON emails(thread_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emails_category ON emails(category)"
+    )
+
     connection.commit()
     connection.close()
