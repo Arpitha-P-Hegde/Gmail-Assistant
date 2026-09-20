@@ -1,18 +1,13 @@
-# from auth import get_credentials
-
-# def main():
-#     creds = get_credentials()
-
-#     print("Authentication successful!")
-#     print(creds.valid)
-
-# if __name__ == "__main__":
-#     main()
-
 from gmail_service import GmailService
+from ml.parser import parse_gmail_message
+
+from database.db import initialize_database
+from database.email_repository import save_email
 
 
 def main():
+
+    initialize_database()
 
     gmail = GmailService()
 
@@ -22,14 +17,13 @@ def main():
 
     for index, message in enumerate(messages, start=1):
 
-        metadata = gmail.get_message(message["id"])
+        raw_message = gmail.get_message(message["id"])
 
-        subject = gmail.get_header(
-            metadata,
-            "Subject",
-        )
+        email = parse_gmail_message(raw_message)
 
-        print(f"{index}. {subject}")
+        save_email(email)
+
+        print(f"{index}. {email['subject']}")
 
 
 if __name__ == "__main__":
