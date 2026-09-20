@@ -18,3 +18,10 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Desktop UI build artifacts
+node_modules/
+dist/
+
+run_project.txt
+

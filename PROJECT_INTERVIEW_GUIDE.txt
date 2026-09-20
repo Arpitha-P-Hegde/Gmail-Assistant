@@ -1,564 +1,448 @@
-SMART MAIL MANAGER
-INTERVIEW PREPARATION GUIDE
-===========================
+SMART MAIL MANAGER — COMPLETE INTERVIEW GUIDE
+================================================
 
-Purpose of this document
-------------------------
-This guide explains the current Smart Mail Manager project from an interview
-perspective. It covers what the code currently does, the concepts behind it,
-how to describe the design, likely interview questions, limitations, and the
-next engineering steps.
-
-The most important accuracy point is this: the repository currently contains a
-working Gmail authentication, retrieval, MIME parsing, and text-cleaning
-foundation. The database layer, feature extraction layer, model layer, and
-automatic classification workflow are not implemented yet. In an interview,
-describe those as planned extensions rather than completed features.
-
-
-1. Project summary
-------------------
-Smart Mail Manager is a Python application that connects to Gmail, retrieves
-recent messages, converts Gmail's nested API representation into a simpler
-email record, and prepares email content for future machine-learning-based
-classification or organization.
-
-Current end-to-end flow:
-
-    credentials.json / token.json
-            |
-            v
-        auth.py
-            |
-            v
-    gmail_client.py  ---> authenticated Gmail API service
-            |
-            v
-        gmail_service.py
-            |
-            v
-    raw Gmail message
-            |
-            v
-        ml/parser.py
-            |
-            v
-    normalized email dictionary
-            |
-            v
-        ml/cleaner.py
-            |
-            v
-    cleaned text and sender features
-
-The current executable demonstration is src/main.py. It authenticates with
-Gmail, lists up to ten recent messages, retrieves each full message, and prints
-its subject.
-
-
-2. Repository structure
-----------------------
-.
-|-- credentials.json       Google OAuth client configuration; secret material
-|-- token.json             User OAuth token; generated and sensitive
-|-- requirements.txt       Pinned Python dependencies
-|-- data/                  Reserved for application data or model artifacts
-|-- src/
-    |-- auth.py            OAuth credential loading, refresh, and first login
-    |-- gmail_client.py    Construction of the Gmail API client
-    |-- gmail_service.py   Small service wrapper around Gmail operations
-    |-- main.py            Current command-line entry point
-    |-- test_parser.py     Live Gmail parsing demonstration/smoke script
-    |-- test_cleaner.py    Live Gmail parsing and cleaning demonstration
-    |-- database/          Currently empty; persistence is not implemented
-    |-- ml/
-        |-- __init__.py
-        |-- parser.py      Gmail payload normalization and MIME body extraction
-        |-- cleaner.py     Text normalization and sender decomposition
-        |-- features.py    Currently empty; feature engineering is planned
-        |-- models/        Currently empty; trained models are planned
-
-The .gitignore excludes OAuth files, virtual environments, Python cache files,
-and local database files. This is important because authentication tokens and
-local databases can contain private user information.
-
-
-3. Architecture and responsibilities
--------------------------------------
-
-3.1 Authentication: src/auth.py
-
-The module defines a read-only Gmail scope:
-
-    https://www.googleapis.com/auth/gmail.readonly
-
-Using the narrowest practical scope follows the principle of least privilege:
-the application can read mail but cannot send, delete, label, or modify it.
-
-Path handling uses pathlib.Path. BASE_DIR is calculated from the location of
-auth.py, so credentials are found relative to the project root rather than the
-process's current working directory. This makes launching the program from a
-different directory more reliable.
-
-get_credentials() follows this sequence:
-
-1. Start with no credentials in memory.
-2. If token.json exists, deserialize the authorized-user credentials.
-3. If the credentials are expired and have a refresh token, refresh them using
-   google.auth.transport.requests.Request.
-4. If credentials are missing or invalid, load the OAuth client configuration
-   from credentials.json and run InstalledAppFlow.run_local_server().
-5. Persist the newly authorized credentials as token.json.
-6. Return the Credentials object.
-
-Important OAuth concepts:
-
-- Authentication answers who the user is.
-- Authorization answers what the application may access.
-- An access token is short-lived and is sent to APIs.
-- A refresh token allows the application to obtain a new access token without
-  asking the user to log in again.
-- OAuth consent is delegated access; the application does not receive the
-  user's Gmail password.
-- The local-server flow opens a browser and receives the OAuth redirect on a
-  temporary local port.
-
-The current implementation refreshes an expired token in memory but does not
-explicitly rewrite the refreshed token to token.json. A production version
-should persist refreshed credentials when needed and should handle missing or
-invalid credential files with user-friendly errors.
-
-3.2 Gmail client construction: src/gmail_client.py
-
-get_gmail_service() is a factory function. It obtains credentials and passes
-them to googleapiclient.discovery.build with serviceName="gmail" and
-version="v1". The returned object is a Google API resource client.
-
-This separation keeps OAuth details out of the service class. It also makes a
-future dependency-injection design possible: tests could pass a fake service
-instead of performing real network calls.
-
-3.3 Gmail operations: src/gmail_service.py
-
-GmailService owns the authenticated API resource and exposes three operations:
-
-- list_recent_messages(max_results=10): calls users.messages.list for the
-  special userId "me" and returns message summary objects, normally including
-  message IDs and thread IDs.
-- get_message(message_id): calls users.messages.get with format="full" so the
-  application receives headers, MIME structure, body data, labels, and other
-  message metadata.
-- get_header(message, header_name): performs a case-insensitive search through
-  payload headers and returns the matching value or an empty string.
-
-The service is a thin wrapper, not a complete repository. It currently does
-not paginate results, filter by query, retry transient API errors, control
-rate limits, or cache messages. It also fetches each full message separately,
-which is simple but can result in an N+1 request pattern.
-
-The "me" user ID is a Gmail API convention meaning the authenticated account.
-This avoids hard-coding an email address.
-
-3.4 Entry point: src/main.py
-
-main() creates GmailService, requests the default number of recent messages,
-prints the count, fetches each message by ID, extracts its Subject header, and
-prints a numbered list. The if __name__ == "__main__" guard ensures main runs
-when the file is executed directly but not merely when it is imported.
-
-The commented authentication-only block is an earlier diagnostic milestone.
-It is useful history, but it is not part of the current runtime path.
-
-
-4. Gmail message and MIME concepts
------------------------------------
-Gmail does not return a message body as one guaranteed plain-text field. The
-message is represented as a payload tree based on MIME, the standard format
-used to describe email content and attachments.
-
-Common MIME situations:
-
-- text/plain: readable plain text body
-- text/html: HTML body requiring tag removal before classification
-- multipart/alternative: usually contains both plain-text and HTML versions
-- multipart/mixed: may contain a body plus attachments
-- nested multipart parts: a tree can contain more trees
-- filename on a part: a useful signal that an attachment exists
-
-Base64url encoding
-
-Gmail body data is commonly base64url encoded. ml/parser.py adds the required
-padding, decodes with base64.urlsafe_b64decode, and converts bytes to UTF-8.
-errors="ignore" prevents a malformed byte sequence from crashing parsing, but
-it can silently discard characters. A production implementation would record
-that decoding issue and consider a more explicit fallback strategy.
-
-The recursive parser walks payload parts. For a text/plain or text/html payload
-it decodes the body. HTML is passed through BeautifulSoup with the built-in
-html.parser and converted to text with spaces between elements. For a
-multipart payload it recursively checks child parts and returns the first
-non-empty body it finds.
-
-This first-non-empty policy is easy to understand, but it is a heuristic. A
-stronger implementation would prefer text/plain over text/html when both are
-available, collect all suitable body parts, avoid quoted reply history when
-appropriate, and separately track attachment metadata.
-
-
-5. Parsing: src/ml/parser.py
+1. THE 60-SECOND EXPLANATION
 ----------------------------
-parse_gmail_message(msg) converts an API response into a stable dictionary:
-
-    id
-    thread_id
-    from
-    to
-    cc
-    subject
-    date
-    snippet
-    label_ids
-    has_attachment
-    body
-
-Headers are normalized into a dictionary with lowercase keys. This avoids
-depending on whether Gmail spells a header as Subject, subject, or another
-case. The returned shape is useful because later code does not need to know
-the details of Gmail's response format.
-
-The parser uses .get() in many places to tolerate absent optional fields. This
-is defensive parsing: external API payloads should not be assumed to be
-complete. One exception is GmailService.get_header(), which indexes
-message["payload"]["headers"] directly and can raise KeyError for an unusual
-or malformed message. Aligning both paths around safe access would improve
-robustness.
-
-Attachment detection is recursive. It returns true when the current payload or
-any descendant has a filename. It does not download attachments, inspect their
-content, or distinguish inline images from user documents.
-
-
-6. Cleaning and normalization: src/ml/cleaner.py
-------------------------------------------------
-clean_text(text) prepares body text for search or machine learning while
-preserving semantic placeholders.
-
-Its current transformations are:
-
-1. Return an empty string for empty input.
-2. Remove HTML conditional comments.
-3. Remove remaining HTML tags.
-4. Replace URLs with the token URL.
-5. Replace email addresses with the token EMAIL.
-6. Replace phone-like values with the token PHONE.
-7. Replace currency values beginning with $, INR, euro, or pound symbols with
-   the token MONEY.
-8. Decode two common HTML entities.
-9. Lowercase the text.
-10. Collapse whitespace and trim the result.
-
-Replacing values instead of deleting them preserves category information. For
-example, an invoice containing a money amount still signals that money was
-present without forcing a model to memorize every amount. It also reduces
-high-cardinality and potentially sensitive data.
-
-Regex tradeoffs are worth discussing in an interview. The URL, email, phone,
-and money patterns are practical heuristics, not complete parsers. They can
-miss international formats or replace text incorrectly. The phone expression
-can also match some non-phone numeric strings. A production system would test
-these patterns against representative mail and document the expected behavior.
-
-clean_subject(subject) removes repeated reply and forward prefixes such as
-Re:, Fw:, and Fwd:, then sends the subject through clean_text. This makes
-subjects from the same conversation more comparable.
-
-extract_sender_parts(sender) handles either a display-name form such as
-"Example Team <team@example.com>" or a bare address. It returns:
-
-    sender_name
-    sender_email
-    sender_domain
-
-The domain is lowercased and extracted after the first @. This can support
-features such as sender-domain frequency or organization-level grouping.
-The current parser does not decode encoded display names or validate email
-syntax, so those are possible future improvements.
-
-
-7. Machine-learning readiness
------------------------------
-The project is ML-ready in the sense that it has a normalized email record and
-deterministic cleaning functions. It does not yet contain a trained classifier.
-ml/features.py and ml/models/ are currently empty.
-
-A sensible future feature pipeline could combine:
-
-- TF-IDF features from cleaned subject and body
-- sender domain and sender frequency
-- message labels and thread information
-- attachment presence
-- body and subject length
-- URL, email, phone, and money placeholder counts
-- time or day features derived from the Date header
-- optional user-provided labels as training targets
-
-Possible baseline models from scikit-learn include logistic regression, linear
-SVM, or multinomial naive Bayes for categories such as work, promotions,
-personal, receipts, or newsletters. Start with a transparent baseline before
-trying a more complex model.
-
-Typical supervised-learning workflow:
-
-1. Collect messages with consent and define stable category labels.
-2. Split data into train, validation, and test sets without leaking related
-   messages across sets where possible.
-3. Fit text vectorization only on training data.
-4. Train a baseline classifier.
-5. Evaluate precision, recall, F1, and a confusion matrix per class.
-6. Inspect false positives and false negatives.
-7. Serialize the fitted pipeline with a version and preprocessing metadata.
-8. Run inference on newly parsed and cleaned messages.
-9. Capture corrections for later retraining.
-
-Data leakage is a key interview topic. Fitting a TF-IDF vectorizer or choosing
-thresholds using the test set makes evaluation optimistic. Thread-level or
-time-based splitting may better model production behavior than random row
-splitting because nearby messages are correlated.
-
-Privacy is equally important. Email is sensitive data. A production design
-should minimize retention, protect stored content, restrict logs, encrypt
-local data, provide deletion controls, and avoid sending message content to an
-external model without explicit consent.
-
-
-8. Database and persistence roadmap
------------------------------------
-The database directory is empty and .gitignore excludes local database files,
-so there is currently no persistence implementation.
-
-A future schema might contain:
-
-- emails: Gmail message ID, thread ID, sender fields, subject, date, snippet,
-  body hash, cleaned text, attachment flag, and timestamps
-- labels or categories: category name and model version
-- predictions: email ID, predicted category, confidence, and model version
-- user_feedback: corrected category and correction timestamp
-
-Use Gmail message ID as an idempotency key. Fetching the same message again
-should update or skip the existing record rather than create duplicates. A
-body hash can help detect changes without storing duplicate content.
-
-SQLite is a reasonable local starting point. A larger deployment may use a
-server database, but the privacy and access-control design must grow with it.
-
-
-9. Testing and current verification
-------------------------------------
-test_parser.py and test_cleaner.py are named as tests, but they currently run
-real Gmail calls at import/execution time and print diagnostic output. They are
-better described as manual integration or smoke scripts.
-
-Current demonstrations include:
-
-- inspecting a message's date, MIME type, and number of parts
-- printing the MIME tree and decoded body parts
-- parsing one live message
-- cleaning its body and subject
-- extracting sender components
-
-They require valid OAuth files, network access, and at least one available
-message. They are not deterministic unit tests and should not be run in CI as
-written.
-
-Recommended unit tests should use fixture dictionaries and avoid Gmail:
-
-- plain text payload decodes correctly
-- HTML payload becomes readable text
-- nested multipart payload is traversed
-- missing body data returns an empty string
-- malformed base64 does not crash the parser
-- attachments are detected recursively
-- mixed-case headers are normalized
-- repeated Re:/Fwd: prefixes are removed
-- URLs, addresses, phones, and money values become placeholders
-- sender display names and bare addresses are parsed correctly
-- empty and unusual inputs are handled safely
-
-Recommended integration tests should isolate network access, use a fake Gmail
-service or mocked google API resource, and test pagination, authentication
-failure, rate limiting, and API error handling separately.
-
-
-10. Running the current project
--------------------------------
-From the project root, create or activate a virtual environment and install:
-
-    python -m venv .venv
-    .venv\Scripts\activate
-    pip install -r requirements.txt
-
-Google Cloud setup is required before the first run:
-
-1. Create or select a Google Cloud project.
-2. Enable the Gmail API.
-3. Configure the OAuth consent screen.
-4. Create an OAuth client suitable for a desktop application.
-5. Place the downloaded client configuration at the project root as
-   credentials.json.
-6. Run from src so the current absolute imports resolve:
-
-       cd src
-       python main.py
-
-The first run opens a browser for consent and writes token.json. Later runs
-reuse or refresh the saved token. The current imports are simple module-level
-imports such as "from gmail_service import GmailService", so running from the
-src directory is the least surprising invocation. A package layout with
-relative imports or an installed console entry point would make root-level
-execution cleaner.
-
-The live demo prints subjects only. Parser and cleaner scripts print more
-diagnostic information and require a real message. Never commit credentials or
-tokens and never include full email bodies in shared logs.
-
-
-11. Likely interview questions and strong answers
---------------------------------------------------
-
-Q: Explain the architecture in one minute.
-A: The application has a small layered design. auth.py owns Gmail OAuth and
-   token reuse. gmail_client.py builds the authenticated Gmail API client.
-   gmail_service.py wraps message listing, retrieval, and header access.
-   parser.py converts Gmail's nested MIME payload into a stable email record.
-   cleaner.py normalizes text and extracts sender attributes for a future ML
-   pipeline. main.py currently demonstrates retrieval by printing subjects.
-
-Q: Why use a read-only OAuth scope?
-A: The current feature only reads messages, so gmail.readonly follows least
-   privilege and limits the impact of a compromised token. Broader scopes
-   should be added only when a concrete feature requires them.
-
-Q: What happens when the access token expires?
-A: If a saved credential has a refresh token, get_credentials refreshes it.
-   Otherwise the code starts the installed-app OAuth flow again. I would also
-   persist refreshed credentials and add explicit error handling around refresh.
-
-Q: Why is Gmail message parsing recursive?
-A: MIME messages are trees. Multipart containers can contain text bodies,
-   nested multiparts, and attachments at different levels, so recursion is a
-   natural way to inspect every descendant.
-
-Q: Why clean URLs and email addresses instead of deleting them?
-A: Their presence can be predictive, but exact values are high-cardinality and
-   may expose private information. Placeholder tokens preserve semantic signal
-   while reducing noise and memorization.
-
-Q: What is the biggest performance issue in the current demo?
-A: It first lists messages and then calls get for every message, creating one
-   additional API request per message. I would add pagination, bounded batch
-   processing, retry/backoff, and caching or incremental synchronization.
-
-Q: What would you test first?
-A: Pure parser and cleaner unit tests using fixed payload fixtures. They are
-   fast, deterministic, and cover the most complex local logic without OAuth or
-   network dependencies.
-
-Q: What is missing before calling this a complete mail manager?
-A: Persistence, feature extraction, model training/inference, user feedback,
-   synchronization state, pagination, error handling, structured logging, and
-   a user-facing action such as categorization or reporting. The current code
-   is the ingestion and preprocessing foundation.
-
-Q: How would you prevent duplicate processing?
-A: Store the Gmail message ID as a unique key, track history or a sync cursor,
-   and make processing idempotent. A stored content hash and model version can
-   determine whether reprocessing is necessary.
-
-Q: How would you evaluate an email classifier?
-A: Use a held-out, leakage-resistant test set and report per-class precision,
-   recall, F1, and a confusion matrix. For user-facing automation, confidence
-   thresholds and the cost of incorrect actions matter more than accuracy alone.
-
-Q: What security risks do you see?
-A: OAuth tokens and email content are sensitive. The app should use least
-   privilege, protect file permissions, keep secrets out of source control,
-   minimize retention, redact logs, validate external data, and define how
-   users revoke access and delete stored content.
-
-
-12. Strengths and limitations to discuss honestly
---------------------------------------------------
-Strengths:
-
-- Clear separation between authentication, API access, parsing, and cleaning.
-- Read-only Gmail permission is appropriately narrow for the current scope.
-- pathlib makes credential paths independent of the launch directory.
-- Recursive MIME traversal handles nested message structures.
-- Defensive .get() access in the parser tolerates missing API fields.
-- Cleaning preserves useful semantic categories with explicit placeholders.
-- Pinned dependencies make the environment more reproducible.
-
-Limitations:
-
-- No persistence, classifier, feature engineering, or model artifacts yet.
-- No pagination or Gmail query support.
-- Full-message retrieval can create many API calls.
-- Network, OAuth, and API errors are not handled with application-level
-  messages or retry policies.
-- Refreshed credentials are not explicitly persisted.
-- get_header() assumes payload and headers are present.
-- MIME selection returns the first non-empty part rather than preferring a
-  well-defined representation.
-- Demo scripts depend on live mail and are not isolated automated tests.
-- Imports assume execution from the src directory.
-- Sensitive values may be printed by the diagnostic scripts.
-
-
-13. Practical implementation roadmap
+Smart Mail Manager is a privacy-oriented desktop email-organising and search
+application. A user authorises read-only Gmail access through OAuth 2.0. The
+Python backend synchronises recent Gmail messages, parses their MIME payloads,
+stores normalised records locally in SQLite, assigns each message a category,
+and builds semantic vectors in a local FAISS index. The React/Electron desktop
+client then lets the user browse filters, read an email, synchronise again, or
+ask natural-language questions about the local mailbox.
+
+The key design choice is that it is a local retrieval system, not a general
+chatbot with mailbox access. Structured queries such as “show unread job
+emails” are resolved from SQLite metadata. Semantic questions use local
+all-MiniLM-L6-v2 embeddings and FAISS. FLAN-T5-small is loaded locally only
+when the user asks to summarise an already retrieved email. That separation
+reduces hallucination risk and keeps mail content on the user’s machine after
+the one-time Gmail retrieval.
+
+Interview pitch:
+“I built a desktop Gmail assistant with a React/Electron UI and a Python
+FastAPI adapter. Its pipeline is Gmail OAuth → MIME parsing → SQLite → hybrid
+rule/embedding categorisation → FAISS semantic retrieval. Intent routing keeps
+metadata answers deterministic, and generative AI is constrained to summaries
+of retrieved source mail.”
+
+
+2. WHAT THE APPLICATION DOES TODAY
+----------------------------------
+Implemented:
+
+* OAuth 2.0 browser consent for Gmail’s gmail.readonly scope.
+* Fetch up to 50 recent Gmail messages and parse headers, labels, MIME body,
+  snippet, thread ID, and attachment presence.
+* Store only new Gmail message IDs in local SQLite.
+* Categorise mail as Jobs, Education, Shopping, Bank, LinkedIn, GitHub, or
+  Other using deterministic rules first and embeddings otherwise.
+* Build/search a FAISS semantic vector index.
+* Browse Inbox, category, attachment, important, and starred views.
+* Answer latest, metadata, sender, subject, semantic-search, and summary
+  requests with clickable source emails.
+* Summarise a retrieved email locally using FLAN-T5-small, with a deterministic
+  excerpt fallback if the generated text fails quality checks.
+
+Not implemented / incomplete:
+
+* No send, delete, label-change, or other Gmail write operation.
+* Attachments are detected, not downloaded or scanned.
+* Sync is recent-message polling, not pagination, Gmail history-ID incremental
+  sync, push notifications, or a background scheduler.
+* There is no trained classifier, feedback loop, account system, encryption
+  layer, formal migrations, telemetry, or automated test suite.
+* Electron does not start/package the Python backend. The UI hard-codes
+  http://127.0.0.1:8000/api, so a packaged app still needs local FastAPI.
+
+
+3. COMPLETE TECHNOLOGY STACK
+----------------------------
+Layer                 Technology                         Purpose
+--------------------  ---------------------------------  ---------------------------------------
+Desktop shell         Electron                            Native desktop window around the web UI
+Frontend              React + ReactDOM                   Component/state-based interface
+Frontend tooling      Vite + @vitejs/plugin-react        Dev server and production web bundling
+Frontend language     JavaScript/JSX, CSS                UI logic and fixed three-pane design
+HTTP adapter          FastAPI + Uvicorn                  Local REST API for the frontend
+Validation            Pydantic                           Validates /api/ask payloads
+Backend               Python 3.13 (local venv)           Gmail, data, ML, and API logic
+Gmail API             google-api-python-client           Gmail v1 client
+OAuth                 google-auth / google-auth-oauthlib Installed-app OAuth 2.0 / refresh tokens
+Persistence           SQLite3 (Python stdlib)            Local relational email cache
+HTML parsing          BeautifulSoup4                     Converts HTML mail to readable text
+Embeddings            sentence-transformers              Encodes messages and queries
+Embedding model       all-MiniLM-L6-v2                   Local sentence embeddings (normally 384-D)
+Vector search         FAISS (faiss-cpu)                  Exact dense-vector similarity search
+Generation            transformers + torch               Local FLAN-T5 inference
+Generation model      google/flan-t5-small               Controlled source-grounded summaries
+Data formats          JSON, base64url, RFC 2822 dates    Gmail labels/body and time parsing
+Version control       Git                                History and secret/build ignores
+
+package.json has npm run dev, npm run build, and npm run desktop. Its frontend
+dependencies use “latest”; the package-lock currently supplies reproducible
+resolved versions, but explicit tested version ranges are better practice.
+
+Dependency accuracy note: requirements.txt declares Google libraries, NumPy,
+scikit-learn, SciPy, and BeautifulSoup; requirements-api.txt declares FastAPI
+and Uvicorn. The code also imports faiss-cpu, sentence-transformers,
+transformers, and torch, but they are absent from both requirements files.
+They are installed in the inspected venv (FAISS 1.15.1,
+sentence-transformers 6.1.0, transformers 5.17.0, torch 2.14.0). A clean
+installation will fail for categorisation, indexing, search, or summaries until
+those runtime packages are pinned and declared.
+
+
+4. ARCHITECTURE
+---------------
+
+    Gmail API (Google cloud)
+             | OAuth 2.0 / HTTPS / read-only
+             v
+    auth.py → gmail_client.py → GmailService
+             |
+             v
+    main.sync_emails()
+       | parse MIME, headers and labels
+       v
+    SQLite data/mail.db  ← category update
+       |                         ^
+       |                         | rules + MiniLM category similarity
+       +→ build_index.py → FAISS data/emails.faiss + JSON ID metadata
+                                  |
+    React/Electron ← HTTP/JSON ← FastAPI api.py ← rag.py/search_emails.py
+                                  |
+                           local MiniLM / local FLAN-T5 when needed
+
+There are two deliberate data paths:
+
+1. SQLite is the durable source of truth for stored records and exact metadata
+   filters.
+2. FAISS is a derived, rebuildable vector index for semantic queries. Its
+   vector positions map to Gmail IDs through faiss_metadata.json, then to
+   current SQLite rows.
+
+
+5. END-TO-END FLOWS
+-------------------
+Authentication and sync
+
+1. auth.get_credentials reads token.json, if present.
+2. Expired credentials with a refresh token are refreshed in memory. Otherwise
+   InstalledAppFlow.run_local_server(port=0) opens browser consent and writes
+   token.json. OAuth delegates access; the app never sees a Gmail password.
+3. GmailService lists recent IDs with userId="me" and fetches each full message.
+4. ml.parser normalises each Gmail payload into a stable email dictionary.
+5. save_email uses INSERT OR IGNORE and Gmail ID as the primary key, making
+   repeated storage syncs idempotent.
+6. categorize_emails assigns categories only to uncategorised rows.
+7. UI sync passes rebuild_index=True, recreating FAISS and its JSON metadata
+   from all SQLite emails.
+
+Browse mail
+
+Electron opens a BrowserWindow with context isolation enabled and Node
+integration disabled. React calls loopback FastAPI using fetch. FastAPI
+serialises SQLite data to stable frontend fields. The UI has a sidebar, list,
+reader, and assistant; selecting a list row fetches the full body by ID.
+
+Ask the inbox
+
+1. POST /api/ask validates a 1–1000-character query.
+2. rag.detect_intent applies deliberately small deterministic rules.
+3. Latest answers use SQLite dates; metadata answers use SQLite labels/fields;
+   semantic/sender/subject retrieval uses FAISS.
+4. FAISS source matches are shown as cards with similarity scores.
+5. A summary runs FLAN-T5 only on the top retrieved email, with body truncated
+   to 2,500 characters; invalid generation falls back to a deterministic excerpt.
+
+
+6. BACKEND MODULES
+------------------
+src/auth.py
+  Owns scope, project-relative credential paths, saved-token loading, refresh,
+  first login, and token persistence. Scope is gmail.readonly.
+
+src/gmail_client.py and src/gmail_service.py
+  Separate Gmail API construction from list/get operations. Full messages are
+  retrieved with format="full". This is a thin wrapper, which is easy to mock.
+
+src/main.py
+  Orchestrates sync: initialise DB, fetch/parse/store, categorise, optionally
+  rebuild FAISS, and return added/existing/fetched counts. It catches only
+  TransportError during service creation; other Gmail API calls need handling.
+
+src/ml/parser.py
+  Produces id, thread_id, from, to, cc, subject, date, snippet, label_ids,
+  has_attachment, and body. It lowercases headers, recursively traverses MIME,
+  base64url-decodes data, converts HTML through BeautifulSoup, and treats a
+  filename in any part as an attachment. It returns the first non-empty text
+  part; it does not download attachments.
+
+src/ml/cleaner.py
+  Strips HTML and replaces URLs, email addresses, phones, and money values
+  with semantic markers; also normalises subjects and sender parts. It is
+  currently an available utility, not used by the active embedding pipeline,
+  which stores raw parsed body_text.
+
+src/database/db.py
+  Creates data/mail.db and emails table, compatibly adds category to older DBs,
+  and creates thread/category indexes. sqlite3.Row provides dictionary access.
+
+src/database/email_repository.py
+  Provides INSERT OR IGNORE persistence, lookup by ID, thread/category lookup,
+  category update, and correctly parsed date ordering for latest email.
+
+src/categorize_emails.py
+  Uses high-confidence sender/keyword rules first. Otherwise it embeds
+  “Subject + body”, compares it to embeddings of category descriptions, and
+  selects the largest normalised dot product (cosine similarity).
+
+src/ml/embeddings.py and src/ml/build_index.py
+  Load all-MiniLM-L6-v2 in offline-only mode, create normalised message vectors,
+  add them to faiss.IndexFlatIP, and persist binary index plus aligned metadata.
+
+src/search_emails.py
+  Applies structured filters to SQLite rows. No text query means metadata-only,
+  newest-first search; a text query searches all FAISS vectors then applies the
+  allowed-ID filter, avoiding a false empty result when top vector hits fail a
+  metadata condition.
+
+src/rag.py
+  Routes intent and formats retrieved answers. “RAG” is intentionally narrow:
+  nearly all responses are deterministic retrieval; generation only summarises
+  a selected retrieved email.
+
+src/api.py
+  Is the local REST boundary. Lifespan initialises SQLite; Pydantic validates
+  asks; serializers translate DB fields to UI shape; endpoints map failures to
+  404, 409, 503, or generic 500 responses.
+
+
+7. DATA MODEL AND VECTOR DESIGN
+--------------------------------
+SQLite table emails:
+
+id TEXT PRIMARY KEY             Gmail message ID / deduplication key
+thread_id TEXT                  Gmail conversation relationship
+sender, recipient, cc TEXT      Header values
+subject, date, snippet TEXT     Display and retrieval metadata
+label_ids TEXT                  JSON array of Gmail labels
+has_attachment INTEGER          SQLite boolean (0/1)
+body_text TEXT                  Parsed readable body
+created_at TEXT                 SQLite insertion timestamp
+category TEXT                   Local predicted category
+
+Indexes: idx_emails_thread_id and idx_emails_category.
+
+Vector search facts:
+
+* Text is “Subject: {subject}\n\n{body}”.
+* MiniLM emits normally 384-dimensional vectors.
+* Vectors are L2-normalised. Inner product of unit vectors equals cosine
+  similarity.
+* IndexFlatIP is exact brute-force search: no approximation loss, but query
+  cost grows linearly with mailbox size.
+* JSON metadata is position-aligned with FAISS. DB/index changes require a
+  rebuild; API sync does it, CLI sync does not by default.
+
+
+8. REST API
+-----------
+GET  /api/health                 {"status":"ok"}
+GET  /api/emails                 Up to 100 newest stored emails
+GET  /api/emails/latest          Up to 100 newest stored emails
+GET  /api/emails/unread          Label-filtered list
+GET  /api/emails/important       Label-filtered list
+GET  /api/emails/starred         Label-filtered list
+GET  /api/emails/attachments     Attachment-filtered list
+GET  /api/emails/{email_id}      One email, including full body
+GET  /api/categories/{category}  Category-filtered list
+POST /api/sync                   Sync, categorise, rebuild index
+POST /api/ask                    {"query":"..."} → answer + sources
+
+The API converts snake_case DB fields to UI fields including threadId,
+hasAttachment, and similarity. Development CORS permits localhost Vite origins.
+
+
+9. UI, DESKTOP, SECURITY, AND PRIVACY
 -------------------------------------
-Phase 1: Make ingestion reliable
+React App.jsx uses functional components, hooks, async API calls, loading/error
+states, a three-pane layout, and source-card navigation. Email HTML is rendered
+in an iframe sandbox without script permission. CSS owns scrolling and the
+desktop layout. Electron creates a 1360×860 window and falls back from the Vite
+development server to dist/index.html.
 
-- Convert src into a proper Python package or add a console entry point.
-- Add structured configuration and clear startup validation.
-- Add pagination and Gmail query support.
-- Implement retries with exponential backoff for transient failures.
-- Persist refreshed OAuth credentials.
-- Add deterministic parser and cleaner unit tests with fixtures.
+Good decisions:
 
-Phase 2: Add persistence and synchronization
+* Least-privilege Gmail read-only OAuth.
+* Git ignores credentials.json, token.json, local DBs, node_modules, and dist.
+* Local storage/search and local_files_only models reduce cloud exposure.
+* Electron has context isolation and disabled renderer Node integration.
+* SQL values are parameterised.
+* Summary generation is constrained to a retrieved source and has a fallback.
 
-- Create a SQLite schema and unique Gmail message key.
-- Store sync state and process only new or changed messages.
-- Avoid storing raw bodies unless required; encrypt or minimize retained data.
-- Add safe logging and error records.
+Risks and improvements:
 
-Phase 3: Add ML classification
-
-- Implement feature extraction and a scikit-learn Pipeline.
-- Add labeled data collection and a reproducible training command.
-- Save model, vectorizer, category mapping, and preprocessing version together.
-- Add confidence thresholds and an uncertain/manual-review category.
-- Measure per-class quality and monitor drift.
-
-Phase 4: Add product behavior
-
-- Present categories and confidence to the user.
-- Capture corrections as feedback.
-- Add optional Gmail label actions only after obtaining the minimum required
-  write scope and explicit user consent.
-- Add account disconnect and data deletion flows.
+* token.json and mail.db are plaintext at rest: use OS keychain/permissions and
+  encrypted storage, minimise retention/logging, and offer deletion/revocation.
+* Persist refreshed tokens and handle missing/bad OAuth files clearly.
+* Bind only to loopback, restrict CORS/methods, and protect the local API with
+  a per-launch secret in packaged use.
+* Sanitize mail HTML and block remote images; sandboxing reduces script risk but
+  does not eliminate phishing visuals/tracking resources.
+* Use retries/backoff/rate-limit handling and non-sensitive structured logging.
+* Write FAISS and metadata atomically/version them to prevent mismatch after an
+  interrupted rebuild.
 
 
-14. Final interview framing
----------------------------
-Describe the project as an incremental email-intelligence system. The current
-milestone proves the most foundational integration: secure read-only access to
-Gmail, retrieval of real messages, MIME-aware parsing, and privacy-conscious
-text preprocessing. The architecture deliberately leaves clear extension
-points for persistence, features, and models.
+10. LIMITATIONS AND NEXT ENGINEERING STEPS
+------------------------------------------
+1. N+1 Gmail requests: list IDs then get each full email. Add pagination,
+   bounded concurrency, Gmail history IDs, and incremental sync.
+2. INSERT OR IGNORE makes sync idempotent but stale. Use UPSERT and Gmail
+   history/internal date to update labels/read-state/body.
+3. FAISS can become stale after CLI sync. Version/rebuild atomically or perform
+   incremental index updates.
+4. IndexFlatIP is linear. Benchmark then consider HNSW/IVF and metadata-aware
+   retrieval for larger mailboxes.
+5. MIME parsing returns first readable body, may include reply history, and
+   only detects attachment filenames. Prefer text/plain, track parts/charset,
+   strip quotes/signatures, and distinguish inline content.
+6. Categorisation is heuristic, not trained. Add labelled feedback, confidence
+   thresholds, Uncategorized fallback, offline precision/recall/F1, and model
+   versions.
+7. Keyword intent detection is ambiguous for multi-part questions. Add a tested
+   grammar or constrained classifier with clarification UX.
+8. Packaging needs Electron to supervise/bundle Python and models securely.
+9. test_parser.py/test_cleaner.py are live Gmail smoke scripts, not CI tests.
+   Add pytest fixture/mocks, FastAPI TestClient, React tests, and E2E tests.
+10. Pin every imported runtime dependency and compatible Python version.
 
-The strongest answer is precise about boundaries: do not claim that the
-repository already classifies or organizes mail automatically. Instead, explain
-how the normalized and cleaned representation makes those capabilities
-straightforward to add, which engineering risks must be addressed, and how you
-would validate each next step.
+
+11. INTERVIEW QUESTIONS AND ANSWERS
+-----------------------------------
+Q: Why use SQLite and FAISS together?
+A: SQLite is durable source-of-truth storage and excels at exact fields,
+filters, and transactions. FAISS is purpose-built vector similarity search.
+Making FAISS derived means it can be rebuilt from SQLite.
+
+Q: Why normalise vectors with IndexFlatIP?
+A: L2-normalisation makes dot product equal cosine similarity, so inner-product
+search measures semantic directional similarity without vector magnitude bias.
+
+Q: Is this really RAG?
+A: It is constrained retrieval augmentation. SQLite/FAISS retrieves sources
+first; most answers are formatted deterministic records. Generation only
+summarises a retrieved mail, reducing hallucinated inbox facts.
+
+Q: How does the project prevent hallucination?
+A: Retrieval establishes the source, non-summary paths generate no facts,
+summaries receive only selected source text, generation is deterministic, and
+invalid output falls back to a source-derived excerpt.
+
+Q: Why hybrid categorisation?
+A: Rules provide explainable high-confidence handling for obvious senders and
+keywords; embeddings cover the remaining messages. It is a bootstrap approach
+until labelled data supports a trained, evaluated classifier.
+
+Q: How is sync idempotent?
+A: Gmail message ID is SQLite’s primary key and INSERT OR IGNORE reveals
+whether it is new. Repeated syncs do not duplicate rows; the known trade-off is
+that existing records are not refreshed.
+
+Q: What is the key consistency challenge?
+A: FAISS positions and JSON metadata are aligned. DB changes without rebuild
+make search stale; interrupted separate writes can corrupt alignment. I would
+atomically version/publish both or maintain an incremental index.
+
+Q: How would you scale it?
+A: Measure first; then batch embeddings, use HNSW/IVF approximate search,
+metadata prefiltering, model/index caching, and recall@k evaluation against an
+exact baseline.
+
+Q: How do you protect mail privacy?
+A: Least-privilege OAuth and local processing are the start. Production needs
+encrypted local data/keychain tokens, minimal logging, safe HTML rendering,
+loopback API protection, deletion/revocation controls, and explicit consent for
+any cloud processing.
+
+Q: Why FastAPI instead of renderer-to-Python calls?
+A: It creates a stable/testable HTTP contract while retaining Python Gmail/ML
+libraries and keeping Electron’s renderer security restrictive. Packaged use
+should supervise FastAPI or replace it with a narrow IPC bridge.
+
+Q: What tests would you add first?
+A: MIME/parser and cleaner fixtures; repository idempotency/date ordering;
+intent/filter/index-metadata alignment; FastAPI contracts; UI loading/error/
+source navigation. Isolate OAuth as integration testing, never routine CI.
+
+
+12. DEMO SCRIPT
+---------------
+1. Start the API and show /api/health returning {"status":"ok"}.
+2. Open Electron; demonstrate Inbox, a category, and attachment filter.
+3. Open an email and explain full body loads from local cache on selection.
+4. Sync: explain Gmail ID deduplication, categorisation, and FAISS rebuild.
+5. Ask “Show unread job emails” for deterministic metadata retrieval.
+6. Ask “What emails do I have about Python?” for semantic sources/scores.
+7. Ask “Summarize the Python statistics email” and explain source-scoped local
+   FLAN-T5 generation.
+8. Close with tests, requirements manifest, secure packaging, incremental sync,
+   and measured categorisation quality as next priorities.
+
+
+13. RUN COMMANDS
+----------------
+From root:
+
+  .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-api.txt
+  .\.venv\Scripts\python.exe -m pip install faiss-cpu sentence-transformers transformers torch
+  npm install
+
+Run backend from src because imports use it as their module root:
+
+  cd src
+  ..\.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
+
+In another terminal:
+
+  npm run dev
+  $env:VITE_DEV_SERVER_URL = 'http://localhost:5173'
+  npm run desktop
+
+Useful src commands:
+
+  ..\.venv\Scripts\python.exe main.py                 # sync; no index rebuild by default
+  ..\.venv\Scripts\python.exe -m ml.build_index       # build/rebuild FAISS
+  ..\.venv\Scripts\python.exe categorize_emails.py    # categorise stored email
+  ..\.venv\Scripts\python.exe search_emails.py         # interactive semantic search
+  ..\.venv\Scripts\python.exe rag.py                   # interactive assistant
+
+
+14. REPOSITORY MAP
+------------------
+README.md                    Setup and manual checks
+electron/main.cjs            Electron window/security configuration
+src/ui/                      React UI, API client, CSS
+src/api.py                   FastAPI local REST adapter
+src/auth.py                  OAuth token lifecycle
+src/gmail_client.py          Gmail client factory
+src/gmail_service.py         Gmail list/get wrapper
+src/main.py                  Synchronisation orchestration
+src/ml/parser.py             Gmail/MIME normalisation
+src/ml/cleaner.py            Text/sender cleaning utilities
+src/database/                SQLite schema and repository
+src/categorize_emails.py     Hybrid category assignment
+src/ml/embeddings.py         Sentence-transformer encoding
+src/ml/build_index.py        FAISS construction
+src/search_emails.py         Semantic + metadata retrieval
+src/rag.py                   Intent routing and summaries
+data/mail.db                 Ignored local SQLite cache
+data/emails.faiss            Ignored local vector index
+data/faiss_metadata.json     Ignored vector-position/Gmail-ID mapping
+
+Final interview principle: distinguish shipped functionality from plans. This
+is already an end-to-end local Gmail retrieval product. Its strongest story is
+the separation of relational source-of-truth data, derived semantic retrieval,
+deterministic intent handling, and tightly scoped generation.
