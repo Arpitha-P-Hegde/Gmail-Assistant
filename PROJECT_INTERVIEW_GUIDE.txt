@@ -1,0 +1,564 @@
+SMART MAIL MANAGER
+INTERVIEW PREPARATION GUIDE
+===========================
+
+Purpose of this document
+------------------------
+This guide explains the current Smart Mail Manager project from an interview
+perspective. It covers what the code currently does, the concepts behind it,
+how to describe the design, likely interview questions, limitations, and the
+next engineering steps.
+
+The most important accuracy point is this: the repository currently contains a
+working Gmail authentication, retrieval, MIME parsing, and text-cleaning
+foundation. The database layer, feature extraction layer, model layer, and
+automatic classification workflow are not implemented yet. In an interview,
+describe those as planned extensions rather than completed features.
+
+
+1. Project summary
+------------------
+Smart Mail Manager is a Python application that connects to Gmail, retrieves
+recent messages, converts Gmail's nested API representation into a simpler
+email record, and prepares email content for future machine-learning-based
+classification or organization.
+
+Current end-to-end flow:
+
+    credentials.json / token.json
+            |
+            v
+        auth.py
+            |
+            v
+    gmail_client.py  ---> authenticated Gmail API service
+            |
+            v
+        gmail_service.py
+            |
+            v
+    raw Gmail message
+            |
+            v
+        ml/parser.py
+            |
+            v
+    normalized email dictionary
+            |
+            v
+        ml/cleaner.py
+            |
+            v
+    cleaned text and sender features
+
+The current executable demonstration is src/main.py. It authenticates with
+Gmail, lists up to ten recent messages, retrieves each full message, and prints
+its subject.
+
+
+2. Repository structure
+----------------------
+.
+|-- credentials.json       Google OAuth client configuration; secret material
+|-- token.json             User OAuth token; generated and sensitive
+|-- requirements.txt       Pinned Python dependencies
+|-- data/                  Reserved for application data or model artifacts
+|-- src/
+    |-- auth.py            OAuth credential loading, refresh, and first login
+    |-- gmail_client.py    Construction of the Gmail API client
+    |-- gmail_service.py   Small service wrapper around Gmail operations
+    |-- main.py            Current command-line entry point
+    |-- test_parser.py     Live Gmail parsing demonstration/smoke script
+    |-- test_cleaner.py    Live Gmail parsing and cleaning demonstration
+    |-- database/          Currently empty; persistence is not implemented
+    |-- ml/
+        |-- __init__.py
+        |-- parser.py      Gmail payload normalization and MIME body extraction
+        |-- cleaner.py     Text normalization and sender decomposition
+        |-- features.py    Currently empty; feature engineering is planned
+        |-- models/        Currently empty; trained models are planned
+
+The .gitignore excludes OAuth files, virtual environments, Python cache files,
+and local database files. This is important because authentication tokens and
+local databases can contain private user information.
+
+
+3. Architecture and responsibilities
+-------------------------------------
+
+3.1 Authentication: src/auth.py
+
+The module defines a read-only Gmail scope:
+
+    https://www.googleapis.com/auth/gmail.readonly
+
+Using the narrowest practical scope follows the principle of least privilege:
+the application can read mail but cannot send, delete, label, or modify it.
+
+Path handling uses pathlib.Path. BASE_DIR is calculated from the location of
+auth.py, so credentials are found relative to the project root rather than the
+process's current working directory. This makes launching the program from a
+different directory more reliable.
+
+get_credentials() follows this sequence:
+
+1. Start with no credentials in memory.
+2. If token.json exists, deserialize the authorized-user credentials.
+3. If the credentials are expired and have a refresh token, refresh them using
+   google.auth.transport.requests.Request.
+4. If credentials are missing or invalid, load the OAuth client configuration
+   from credentials.json and run InstalledAppFlow.run_local_server().
+5. Persist the newly authorized credentials as token.json.
+6. Return the Credentials object.
+
+Important OAuth concepts:
+
+- Authentication answers who the user is.
+- Authorization answers what the application may access.
+- An access token is short-lived and is sent to APIs.
+- A refresh token allows the application to obtain a new access token without
+  asking the user to log in again.
+- OAuth consent is delegated access; the application does not receive the
+  user's Gmail password.
+- The local-server flow opens a browser and receives the OAuth redirect on a
+  temporary local port.
+
+The current implementation refreshes an expired token in memory but does not
+explicitly rewrite the refreshed token to token.json. A production version
+should persist refreshed credentials when needed and should handle missing or
+invalid credential files with user-friendly errors.
+
+3.2 Gmail client construction: src/gmail_client.py
+
+get_gmail_service() is a factory function. It obtains credentials and passes
+them to googleapiclient.discovery.build with serviceName="gmail" and
+version="v1". The returned object is a Google API resource client.
+
+This separation keeps OAuth details out of the service class. It also makes a
+future dependency-injection design possible: tests could pass a fake service
+instead of performing real network calls.
+
+3.3 Gmail operations: src/gmail_service.py
+
+GmailService owns the authenticated API resource and exposes three operations:
+
+- list_recent_messages(max_results=10): calls users.messages.list for the
+  special userId "me" and returns message summary objects, normally including
+  message IDs and thread IDs.
+- get_message(message_id): calls users.messages.get with format="full" so the
+  application receives headers, MIME structure, body data, labels, and other
+  message metadata.
+- get_header(message, header_name): performs a case-insensitive search through
+  payload headers and returns the matching value or an empty string.
+
+The service is a thin wrapper, not a complete repository. It currently does
+not paginate results, filter by query, retry transient API errors, control
+rate limits, or cache messages. It also fetches each full message separately,
+which is simple but can result in an N+1 request pattern.
+
+The "me" user ID is a Gmail API convention meaning the authenticated account.
+This avoids hard-coding an email address.
+
+3.4 Entry point: src/main.py
+
+main() creates GmailService, requests the default number of recent messages,
+prints the count, fetches each message by ID, extracts its Subject header, and
+prints a numbered list. The if __name__ == "__main__" guard ensures main runs
+when the file is executed directly but not merely when it is imported.
+
+The commented authentication-only block is an earlier diagnostic milestone.
+It is useful history, but it is not part of the current runtime path.
+
+
+4. Gmail message and MIME concepts
+-----------------------------------
+Gmail does not return a message body as one guaranteed plain-text field. The
+message is represented as a payload tree based on MIME, the standard format
+used to describe email content and attachments.
+
+Common MIME situations:
+
+- text/plain: readable plain text body
+- text/html: HTML body requiring tag removal before classification
+- multipart/alternative: usually contains both plain-text and HTML versions
+- multipart/mixed: may contain a body plus attachments
+- nested multipart parts: a tree can contain more trees
+- filename on a part: a useful signal that an attachment exists
+
+Base64url encoding
+
+Gmail body data is commonly base64url encoded. ml/parser.py adds the required
+padding, decodes with base64.urlsafe_b64decode, and converts bytes to UTF-8.
+errors="ignore" prevents a malformed byte sequence from crashing parsing, but
+it can silently discard characters. A production implementation would record
+that decoding issue and consider a more explicit fallback strategy.
+
+The recursive parser walks payload parts. For a text/plain or text/html payload
+it decodes the body. HTML is passed through BeautifulSoup with the built-in
+html.parser and converted to text with spaces between elements. For a
+multipart payload it recursively checks child parts and returns the first
+non-empty body it finds.
+
+This first-non-empty policy is easy to understand, but it is a heuristic. A
+stronger implementation would prefer text/plain over text/html when both are
+available, collect all suitable body parts, avoid quoted reply history when
+appropriate, and separately track attachment metadata.
+
+
+5. Parsing: src/ml/parser.py
+----------------------------
+parse_gmail_message(msg) converts an API response into a stable dictionary:
+
+    id
+    thread_id
+    from
+    to
+    cc
+    subject
+    date
+    snippet
+    label_ids
+    has_attachment
+    body
+
+Headers are normalized into a dictionary with lowercase keys. This avoids
+depending on whether Gmail spells a header as Subject, subject, or another
+case. The returned shape is useful because later code does not need to know
+the details of Gmail's response format.
+
+The parser uses .get() in many places to tolerate absent optional fields. This
+is defensive parsing: external API payloads should not be assumed to be
+complete. One exception is GmailService.get_header(), which indexes
+message["payload"]["headers"] directly and can raise KeyError for an unusual
+or malformed message. Aligning both paths around safe access would improve
+robustness.
+
+Attachment detection is recursive. It returns true when the current payload or
+any descendant has a filename. It does not download attachments, inspect their
+content, or distinguish inline images from user documents.
+
+
+6. Cleaning and normalization: src/ml/cleaner.py
+------------------------------------------------
+clean_text(text) prepares body text for search or machine learning while
+preserving semantic placeholders.
+
+Its current transformations are:
+
+1. Return an empty string for empty input.
+2. Remove HTML conditional comments.
+3. Remove remaining HTML tags.
+4. Replace URLs with the token URL.
+5. Replace email addresses with the token EMAIL.
+6. Replace phone-like values with the token PHONE.
+7. Replace currency values beginning with $, INR, euro, or pound symbols with
+   the token MONEY.
+8. Decode two common HTML entities.
+9. Lowercase the text.
+10. Collapse whitespace and trim the result.
+
+Replacing values instead of deleting them preserves category information. For
+example, an invoice containing a money amount still signals that money was
+present without forcing a model to memorize every amount. It also reduces
+high-cardinality and potentially sensitive data.
+
+Regex tradeoffs are worth discussing in an interview. The URL, email, phone,
+and money patterns are practical heuristics, not complete parsers. They can
+miss international formats or replace text incorrectly. The phone expression
+can also match some non-phone numeric strings. A production system would test
+these patterns against representative mail and document the expected behavior.
+
+clean_subject(subject) removes repeated reply and forward prefixes such as
+Re:, Fw:, and Fwd:, then sends the subject through clean_text. This makes
+subjects from the same conversation more comparable.
+
+extract_sender_parts(sender) handles either a display-name form such as
+"Example Team <team@example.com>" or a bare address. It returns:
+
+    sender_name
+    sender_email
+    sender_domain
+
+The domain is lowercased and extracted after the first @. This can support
+features such as sender-domain frequency or organization-level grouping.
+The current parser does not decode encoded display names or validate email
+syntax, so those are possible future improvements.
+
+
+7. Machine-learning readiness
+-----------------------------
+The project is ML-ready in the sense that it has a normalized email record and
+deterministic cleaning functions. It does not yet contain a trained classifier.
+ml/features.py and ml/models/ are currently empty.
+
+A sensible future feature pipeline could combine:
+
+- TF-IDF features from cleaned subject and body
+- sender domain and sender frequency
+- message labels and thread information
+- attachment presence
+- body and subject length
+- URL, email, phone, and money placeholder counts
+- time or day features derived from the Date header
+- optional user-provided labels as training targets
+
+Possible baseline models from scikit-learn include logistic regression, linear
+SVM, or multinomial naive Bayes for categories such as work, promotions,
+personal, receipts, or newsletters. Start with a transparent baseline before
+trying a more complex model.
+
+Typical supervised-learning workflow:
+
+1. Collect messages with consent and define stable category labels.
+2. Split data into train, validation, and test sets without leaking related
+   messages across sets where possible.
+3. Fit text vectorization only on training data.
+4. Train a baseline classifier.
+5. Evaluate precision, recall, F1, and a confusion matrix per class.
+6. Inspect false positives and false negatives.
+7. Serialize the fitted pipeline with a version and preprocessing metadata.
+8. Run inference on newly parsed and cleaned messages.
+9. Capture corrections for later retraining.
+
+Data leakage is a key interview topic. Fitting a TF-IDF vectorizer or choosing
+thresholds using the test set makes evaluation optimistic. Thread-level or
+time-based splitting may better model production behavior than random row
+splitting because nearby messages are correlated.
+
+Privacy is equally important. Email is sensitive data. A production design
+should minimize retention, protect stored content, restrict logs, encrypt
+local data, provide deletion controls, and avoid sending message content to an
+external model without explicit consent.
+
+
+8. Database and persistence roadmap
+-----------------------------------
+The database directory is empty and .gitignore excludes local database files,
+so there is currently no persistence implementation.
+
+A future schema might contain:
+
+- emails: Gmail message ID, thread ID, sender fields, subject, date, snippet,
+  body hash, cleaned text, attachment flag, and timestamps
+- labels or categories: category name and model version
+- predictions: email ID, predicted category, confidence, and model version
+- user_feedback: corrected category and correction timestamp
+
+Use Gmail message ID as an idempotency key. Fetching the same message again
+should update or skip the existing record rather than create duplicates. A
+body hash can help detect changes without storing duplicate content.
+
+SQLite is a reasonable local starting point. A larger deployment may use a
+server database, but the privacy and access-control design must grow with it.
+
+
+9. Testing and current verification
+------------------------------------
+test_parser.py and test_cleaner.py are named as tests, but they currently run
+real Gmail calls at import/execution time and print diagnostic output. They are
+better described as manual integration or smoke scripts.
+
+Current demonstrations include:
+
+- inspecting a message's date, MIME type, and number of parts
+- printing the MIME tree and decoded body parts
+- parsing one live message
+- cleaning its body and subject
+- extracting sender components
+
+They require valid OAuth files, network access, and at least one available
+message. They are not deterministic unit tests and should not be run in CI as
+written.
+
+Recommended unit tests should use fixture dictionaries and avoid Gmail:
+
+- plain text payload decodes correctly
+- HTML payload becomes readable text
+- nested multipart payload is traversed
+- missing body data returns an empty string
+- malformed base64 does not crash the parser
+- attachments are detected recursively
+- mixed-case headers are normalized
+- repeated Re:/Fwd: prefixes are removed
+- URLs, addresses, phones, and money values become placeholders
+- sender display names and bare addresses are parsed correctly
+- empty and unusual inputs are handled safely
+
+Recommended integration tests should isolate network access, use a fake Gmail
+service or mocked google API resource, and test pagination, authentication
+failure, rate limiting, and API error handling separately.
+
+
+10. Running the current project
+-------------------------------
+From the project root, create or activate a virtual environment and install:
+
+    python -m venv .venv
+    .venv\Scripts\activate
+    pip install -r requirements.txt
+
+Google Cloud setup is required before the first run:
+
+1. Create or select a Google Cloud project.
+2. Enable the Gmail API.
+3. Configure the OAuth consent screen.
+4. Create an OAuth client suitable for a desktop application.
+5. Place the downloaded client configuration at the project root as
+   credentials.json.
+6. Run from src so the current absolute imports resolve:
+
+       cd src
+       python main.py
+
+The first run opens a browser for consent and writes token.json. Later runs
+reuse or refresh the saved token. The current imports are simple module-level
+imports such as "from gmail_service import GmailService", so running from the
+src directory is the least surprising invocation. A package layout with
+relative imports or an installed console entry point would make root-level
+execution cleaner.
+
+The live demo prints subjects only. Parser and cleaner scripts print more
+diagnostic information and require a real message. Never commit credentials or
+tokens and never include full email bodies in shared logs.
+
+
+11. Likely interview questions and strong answers
+--------------------------------------------------
+
+Q: Explain the architecture in one minute.
+A: The application has a small layered design. auth.py owns Gmail OAuth and
+   token reuse. gmail_client.py builds the authenticated Gmail API client.
+   gmail_service.py wraps message listing, retrieval, and header access.
+   parser.py converts Gmail's nested MIME payload into a stable email record.
+   cleaner.py normalizes text and extracts sender attributes for a future ML
+   pipeline. main.py currently demonstrates retrieval by printing subjects.
+
+Q: Why use a read-only OAuth scope?
+A: The current feature only reads messages, so gmail.readonly follows least
+   privilege and limits the impact of a compromised token. Broader scopes
+   should be added only when a concrete feature requires them.
+
+Q: What happens when the access token expires?
+A: If a saved credential has a refresh token, get_credentials refreshes it.
+   Otherwise the code starts the installed-app OAuth flow again. I would also
+   persist refreshed credentials and add explicit error handling around refresh.
+
+Q: Why is Gmail message parsing recursive?
+A: MIME messages are trees. Multipart containers can contain text bodies,
+   nested multiparts, and attachments at different levels, so recursion is a
+   natural way to inspect every descendant.
+
+Q: Why clean URLs and email addresses instead of deleting them?
+A: Their presence can be predictive, but exact values are high-cardinality and
+   may expose private information. Placeholder tokens preserve semantic signal
+   while reducing noise and memorization.
+
+Q: What is the biggest performance issue in the current demo?
+A: It first lists messages and then calls get for every message, creating one
+   additional API request per message. I would add pagination, bounded batch
+   processing, retry/backoff, and caching or incremental synchronization.
+
+Q: What would you test first?
+A: Pure parser and cleaner unit tests using fixed payload fixtures. They are
+   fast, deterministic, and cover the most complex local logic without OAuth or
+   network dependencies.
+
+Q: What is missing before calling this a complete mail manager?
+A: Persistence, feature extraction, model training/inference, user feedback,
+   synchronization state, pagination, error handling, structured logging, and
+   a user-facing action such as categorization or reporting. The current code
+   is the ingestion and preprocessing foundation.
+
+Q: How would you prevent duplicate processing?
+A: Store the Gmail message ID as a unique key, track history or a sync cursor,
+   and make processing idempotent. A stored content hash and model version can
+   determine whether reprocessing is necessary.
+
+Q: How would you evaluate an email classifier?
+A: Use a held-out, leakage-resistant test set and report per-class precision,
+   recall, F1, and a confusion matrix. For user-facing automation, confidence
+   thresholds and the cost of incorrect actions matter more than accuracy alone.
+
+Q: What security risks do you see?
+A: OAuth tokens and email content are sensitive. The app should use least
+   privilege, protect file permissions, keep secrets out of source control,
+   minimize retention, redact logs, validate external data, and define how
+   users revoke access and delete stored content.
+
+
+12. Strengths and limitations to discuss honestly
+--------------------------------------------------
+Strengths:
+
+- Clear separation between authentication, API access, parsing, and cleaning.
+- Read-only Gmail permission is appropriately narrow for the current scope.
+- pathlib makes credential paths independent of the launch directory.
+- Recursive MIME traversal handles nested message structures.
+- Defensive .get() access in the parser tolerates missing API fields.
+- Cleaning preserves useful semantic categories with explicit placeholders.
+- Pinned dependencies make the environment more reproducible.
+
+Limitations:
+
+- No persistence, classifier, feature engineering, or model artifacts yet.
+- No pagination or Gmail query support.
+- Full-message retrieval can create many API calls.
+- Network, OAuth, and API errors are not handled with application-level
+  messages or retry policies.
+- Refreshed credentials are not explicitly persisted.
+- get_header() assumes payload and headers are present.
+- MIME selection returns the first non-empty part rather than preferring a
+  well-defined representation.
+- Demo scripts depend on live mail and are not isolated automated tests.
+- Imports assume execution from the src directory.
+- Sensitive values may be printed by the diagnostic scripts.
+
+
+13. Practical implementation roadmap
+-------------------------------------
+Phase 1: Make ingestion reliable
+
+- Convert src into a proper Python package or add a console entry point.
+- Add structured configuration and clear startup validation.
+- Add pagination and Gmail query support.
+- Implement retries with exponential backoff for transient failures.
+- Persist refreshed OAuth credentials.
+- Add deterministic parser and cleaner unit tests with fixtures.
+
+Phase 2: Add persistence and synchronization
+
+- Create a SQLite schema and unique Gmail message key.
+- Store sync state and process only new or changed messages.
+- Avoid storing raw bodies unless required; encrypt or minimize retained data.
+- Add safe logging and error records.
+
+Phase 3: Add ML classification
+
+- Implement feature extraction and a scikit-learn Pipeline.
+- Add labeled data collection and a reproducible training command.
+- Save model, vectorizer, category mapping, and preprocessing version together.
+- Add confidence thresholds and an uncertain/manual-review category.
+- Measure per-class quality and monitor drift.
+
+Phase 4: Add product behavior
+
+- Present categories and confidence to the user.
+- Capture corrections as feedback.
+- Add optional Gmail label actions only after obtaining the minimum required
+  write scope and explicit user consent.
+- Add account disconnect and data deletion flows.
+
+
+14. Final interview framing
+---------------------------
+Describe the project as an incremental email-intelligence system. The current
+milestone proves the most foundational integration: secure read-only access to
+Gmail, retrieval of real messages, MIME-aware parsing, and privacy-conscious
+text preprocessing. The architecture deliberately leaves clear extension
+points for persistence, features, and models.
+
+The strongest answer is precise about boundaries: do not claim that the
+repository already classifies or organizes mail automatically. Instead, explain
+how the normalized and cleaned representation makes those capabilities
+straightforward to add, which engineering risks must be addressed, and how you
+would validate each next step.
